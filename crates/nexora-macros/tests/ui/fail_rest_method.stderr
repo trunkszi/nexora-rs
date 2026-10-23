@@ -1,0 +1,5 @@
+error: unsupported HTTP method
+ --> tests/ui/fail_rest_method.rs:3:17
+  |
+3 | #[rest(method = "FETCH", path = "/items")]
+  |                 ^^^^^^^

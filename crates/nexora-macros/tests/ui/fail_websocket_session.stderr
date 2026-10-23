@@ -1,0 +1,5 @@
+error: session must be &mut WebSocketServerSession
+ --> tests/ui/fail_websocket_session.rs:8:29
+  |
+8 |     fn opened(&mut self, _: &WebSocketServerSession) -> Result<()> {
+  |                             ^^^^^^^^^^^^^^^^^^^^^^^

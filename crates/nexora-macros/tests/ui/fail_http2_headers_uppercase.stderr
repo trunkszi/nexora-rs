@@ -1,0 +1,5 @@
+error: HTTP/2 header names must be lowercase
+ --> tests/ui/fail_http2_headers_uppercase.rs:3:30
+  |
+3 |     let _ = http2_headers! { "Content-Type" => "text/plain" };
+  |                              ^^^^^^^^^^^^^^

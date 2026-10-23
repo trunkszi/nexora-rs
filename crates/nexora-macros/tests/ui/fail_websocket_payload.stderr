@@ -1,0 +1,5 @@
+error: invalid payload type for on_text
+ --> tests/ui/fail_websocket_payload.rs:8:59
+  |
+8 |     fn text(&mut self, _: &mut WebSocketServerSession, _: Bytes) -> Result<()> {
+  |                                                           ^^^^^

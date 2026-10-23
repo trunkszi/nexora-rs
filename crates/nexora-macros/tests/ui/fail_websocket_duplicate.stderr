@@ -1,0 +1,5 @@
+error: duplicate WebSocket event handler
+  --> tests/ui/fail_websocket_duplicate.rs:13:5
+   |
+13 |     fn second(&mut self, _: &mut WebSocketServerSession) -> Result<()> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

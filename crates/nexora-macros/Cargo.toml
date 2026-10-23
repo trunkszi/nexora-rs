@@ -1,0 +1,25 @@
+[package]
+name = "nexora-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Validated protocol literals and declarative Nexora interfaces"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+nexora = { workspace = true }
+nexora-proto = { workspace = true }
+sonic-rs = { workspace = true }
+
+[lints]
+workspace = true

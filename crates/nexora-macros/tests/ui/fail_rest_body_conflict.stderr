@@ -1,0 +1,6 @@
+error: only one body field is allowed
+ --> tests/ui/fail_rest_body_conflict.rs:7:5
+  |
+7 | /     #[body]
+8 | |     second: Vec<u8>,
+  | |___________________^

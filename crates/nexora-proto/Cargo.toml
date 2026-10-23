@@ -1,0 +1,21 @@
+[package]
+name = "nexora-proto"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Sans-IO HTTP, TLS, and WebSocket protocol codecs"
+
+[dependencies]
+thiserror = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+webpki-roots = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }
+
+[lints]
+workspace = true

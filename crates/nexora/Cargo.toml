@@ -1,0 +1,23 @@
+[package]
+name = "nexora"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Single-threaded io_uring HTTP/1.1, HTTP/2, WebSocket, and TLS proactor client and server SDK"
+
+[dependencies]
+cares = { workspace = true }
+libc = { workspace = true }
+liburing = { workspace = true }
+nexora-macros = { workspace = true }
+nexora-proto = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+error: HTTP header values cannot contain line breaks or control bytes
+ --> tests/ui/fail_header_value.rs:3:36
+  |
+3 |     let _ = headers! { "x-name" => "safe\r\ninjected: true" };
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^

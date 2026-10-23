@@ -1,0 +1,5 @@
+error: invalid HTTP header name
+ --> tests/ui/fail_header_name.rs:3:24
+  |
+3 |     let _ = headers! { "bad name" => "value" };
+  |                        ^^^^^^^^^^

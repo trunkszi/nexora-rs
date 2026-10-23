@@ -1,0 +1,5 @@
+error: path parameter {id} has no matching #[path_param] field
+ --> tests/ui/fail_rest_missing_param.rs:3:31
+  |
+3 | #[rest(method = "GET", path = "/items/{id}")]
+  |                               ^^^^^^^^^^^^^

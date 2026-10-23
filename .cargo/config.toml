@@ -1,0 +1,3 @@
+[env]
+# Process-wide resource snapshots require one active test case per binary.
+RUST_TEST_THREADS = "1"

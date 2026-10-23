@@ -1,0 +1,5 @@
+error: WebSocket handler has an invalid argument count
+ --> tests/ui/fail_websocket_signature.rs:5:5
+  |
+5 |     fn on_message(&mut self) {}
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
