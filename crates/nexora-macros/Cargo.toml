@@ -9,6 +9,7 @@ readme = "../../README.md"
 description = "Validated protocol literals and declarative Nexora interfaces"
 
 [lib]
+bench = false
 proc-macro = true
 
 [dependencies]

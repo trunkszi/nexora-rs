@@ -38,6 +38,46 @@ pub enum SocketState {
     Closed,
 }
 
+/// Shared admission guards for socket phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SocketSuperstate {
+    Inactive,
+    Establishing,
+    Active,
+    Teardown,
+}
+
+/// Descriptor ownership and close-submission substates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SocketPhase {
+    Idle,
+    Connecting,
+    Connected,
+    Cancelling,
+    CancelRequested,
+    CloseReady,
+    CloseQueued,
+    CloseSubmitted,
+    Closed,
+}
+impl SocketPhase {
+    /// Returns the parent whose admission and retirement rules apply.
+    pub const fn superstate(self) -> SocketSuperstate {
+        match self {
+            Self::Idle | Self::Closed => SocketSuperstate::Inactive,
+            Self::Connecting => SocketSuperstate::Establishing,
+            Self::Connected => SocketSuperstate::Active,
+            Self::Cancelling
+            | Self::CancelRequested
+            | Self::CloseReady
+            | Self::CloseQueued
+            | Self::CloseSubmitted => SocketSuperstate::Teardown,
+        }
+    }
+}
+
 /// Owns one non-blocking socket, its optional TLS session, and the
 /// fixed-address receive and transmit buffers used by `io_uring` operations.
 ///
@@ -50,13 +90,11 @@ pub enum SocketState {
 /// abandons them.
 pub struct IoUringSocket {
     fd: Option<RawFd>,
-    state: SocketState,
+    phase: SocketPhase,
     tls: Option<TlsSession>,
     rx_buffer: Option<Box<[u8]>>,
     tx_buffer: Option<Box<[u8]>>,
     in_flight_ops: usize,
-    close_requested: bool,
-    close_submitted: bool,
     peer: Option<SocketAddr>,
 }
 
@@ -83,13 +121,11 @@ impl IoUringSocket {
         let tx_buffer = zeroed_buffer(tx_capacity);
         Ok(Self {
             fd: Some(fd),
-            state: SocketState::Idle,
+            phase: SocketPhase::Idle,
             tls: None,
             rx_buffer: Some(rx_buffer),
             tx_buffer: Some(tx_buffer),
             in_flight_ops: 0,
-            close_requested: false,
-            close_submitted: false,
             peer: None,
         })
     }
@@ -103,7 +139,11 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub const fn fd(&self) -> Option<RawFd> {
-        if self.close_submitted { None } else { self.fd }
+        if self.close_submitted() {
+            None
+        } else {
+            self.fd
+        }
     }
 
     /// Returns the current lifecycle state.
@@ -114,7 +154,31 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub const fn state(&self) -> SocketState {
-        self.state
+        match self.phase {
+            SocketPhase::Idle => SocketState::Idle,
+            SocketPhase::Connecting => SocketState::Connecting,
+            SocketPhase::Connected => SocketState::Connected,
+            SocketPhase::Cancelling | SocketPhase::CancelRequested => SocketState::Cancelling,
+            SocketPhase::CloseReady | SocketPhase::CloseQueued | SocketPhase::CloseSubmitted => {
+                SocketState::Closing
+            }
+            SocketPhase::Closed => SocketState::Closed,
+        }
+    }
+
+    /// Returns the descriptor-ownership phase, including close submission.
+    pub const fn phase(&self) -> SocketPhase {
+        self.phase
+    }
+
+    const fn close_requested(&self) -> bool {
+        matches!(
+            self.phase,
+            SocketPhase::CancelRequested
+                | SocketPhase::CloseQueued
+                | SocketPhase::CloseSubmitted
+                | SocketPhase::Closed
+        )
     }
 
     /// Returns the TLS session associated with the socket, if any.
@@ -268,7 +332,7 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub const fn is_closed(&self) -> bool {
-        matches!(self.state, SocketState::Closed)
+        matches!(self.state(), SocketState::Closed)
     }
 
     /// Reports whether the close SQE has been recorded as submitted.
@@ -279,7 +343,10 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub const fn close_submitted(&self) -> bool {
-        self.close_submitted
+        matches!(
+            self.phase,
+            SocketPhase::CloseSubmitted | SocketPhase::Closed
+        )
     }
 
     /// Replaces both buffers with newly allocated zeroed storage.
@@ -296,12 +363,12 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic; an unsatisfiable allocation aborts the process.
     pub fn renew_buffers(&mut self, rx_capacity: usize, tx_capacity: usize) -> Result<()> {
-        if matches!(self.state, SocketState::Closing | SocketState::Closed) {
+        if matches!(self.state(), SocketState::Closing | SocketState::Closed) {
             return Err(Error::InvalidState(
                 "cannot renew buffers while the socket is closing or closed".to_owned(),
             ));
         }
-        if self.close_requested || self.close_submitted {
+        if self.close_requested() || self.close_submitted() {
             return Err(Error::InvalidState(
                 "cannot renew buffers after a close was requested".to_owned(),
             ));
@@ -334,15 +401,15 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn begin_connect(&mut self) -> Result<()> {
-        if !matches!(self.state, SocketState::Idle) {
+        if !matches!(self.state(), SocketState::Idle) {
             return Err(Error::InvalidState(format!(
                 "connect requires an idle socket, current state is {:?}",
-                self.state
+                self.state()
             )));
         }
 
         self.start_op()?;
-        self.state = SocketState::Connecting;
+        self.phase = SocketPhase::Connecting;
         Ok(())
     }
 
@@ -360,16 +427,16 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn connect_completed(&mut self, success: bool) -> Result<bool> {
-        match self.state {
+        match self.state() {
             SocketState::Connecting => {
                 // `retire_op` cannot report a last-operation transition here:
                 // only `Cancelling` converts a retirement into `Closing`.
                 self.retire_op("CONNECT")?;
                 if success {
-                    self.state = SocketState::Connected;
+                    self.phase = SocketPhase::Connected;
                     Ok(false)
                 } else {
-                    self.state = SocketState::Closing;
+                    self.phase = SocketPhase::CloseReady;
                     Ok(true)
                 }
             }
@@ -377,7 +444,7 @@ impl IoUringSocket {
             _ => Err(Error::InvalidState(format!(
                 "connect completion requires the connecting or cancelling state, current state is \
                  {:?}",
-                self.state
+                self.state()
             ))),
         }
     }
@@ -390,10 +457,10 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn begin_op(&mut self) -> Result<()> {
-        if !matches!(self.state, SocketState::Connected) {
+        if !matches!(self.state(), SocketState::Connected) {
             return Err(Error::InvalidState(format!(
                 "receive or send requires a connected socket, current state is {:?}",
-                self.state
+                self.state()
             )));
         }
 
@@ -414,11 +481,14 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn complete_op(&mut self) -> Result<bool> {
-        if !matches!(self.state, SocketState::Connected | SocketState::Cancelling) {
+        if !matches!(
+            self.state(),
+            SocketState::Connected | SocketState::Cancelling
+        ) {
             return Err(Error::InvalidState(format!(
                 "receive or send completion requires the connected or cancelling state, current \
                  state is {:?}",
-                self.state
+                self.state()
             )));
         }
         self.retire_op("receive or send")
@@ -438,13 +508,13 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn request_cancel(&mut self) -> bool {
-        match self.state {
+        match self.state() {
             SocketState::Idle | SocketState::Connecting | SocketState::Connected => {
                 if self.in_flight_ops > 0 {
-                    self.state = SocketState::Cancelling;
+                    self.phase = SocketPhase::Cancelling;
                     false
                 } else {
-                    self.state = SocketState::Closing;
+                    self.phase = SocketPhase::CloseReady;
                     true
                 }
             }
@@ -464,19 +534,14 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn request_close(&mut self) -> bool {
-        if matches!(self.state, SocketState::Closed) || self.close_requested || self.close_submitted
-        {
+        if self.is_closed() || self.close_requested() {
             return false;
         }
-
-        self.close_requested = true;
         if self.in_flight_ops > 0 {
-            if !matches!(self.state, SocketState::Cancelling | SocketState::Closing) {
-                self.state = SocketState::Cancelling;
-            }
+            self.phase = SocketPhase::CancelRequested;
             false
         } else {
-            self.state = SocketState::Closing;
+            self.phase = SocketPhase::CloseQueued;
             true
         }
     }
@@ -493,13 +558,13 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn close_started(&mut self) -> Result<()> {
-        if !matches!(self.state, SocketState::Closing) {
+        if !matches!(self.state(), SocketState::Closing) {
             return Err(Error::InvalidState(format!(
                 "close submission requires the closing state, current state is {:?}",
-                self.state
+                self.state()
             )));
         }
-        if self.close_submitted {
+        if self.close_submitted() {
             return Err(Error::InvalidState(
                 "close was already submitted for this socket".to_owned(),
             ));
@@ -511,8 +576,7 @@ impl IoUringSocket {
             )));
         }
 
-        self.close_requested = true;
-        self.close_submitted = true;
+        self.phase = SocketPhase::CloseSubmitted;
         Ok(())
     }
 
@@ -528,12 +592,22 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn close_submission_failed(&mut self) -> Result<()> {
-        if self.close_submitted {
+        if self.close_submitted() {
             return Err(Error::InvalidState(
                 "close SQE was already recorded as submitted; a retry would close twice".to_owned(),
             ));
         }
-        self.close_requested = false;
+        self.phase = match self.phase {
+            SocketPhase::CancelRequested => SocketPhase::Cancelling,
+            SocketPhase::CloseQueued => SocketPhase::CloseReady,
+            phase @ (SocketPhase::Idle
+            | SocketPhase::Connecting
+            | SocketPhase::Connected
+            | SocketPhase::Cancelling
+            | SocketPhase::CloseReady
+            | SocketPhase::CloseSubmitted
+            | SocketPhase::Closed) => phase,
+        };
         Ok(())
     }
 
@@ -552,13 +626,13 @@ impl IoUringSocket {
     /// # Panics
     /// This function does not panic.
     pub fn close_completed(&mut self) -> Result<()> {
-        if !matches!(self.state, SocketState::Closing) {
+        if !matches!(self.state(), SocketState::Closing) {
             return Err(Error::InvalidState(format!(
                 "close completion requires the closing state, current state is {:?}",
-                self.state
+                self.state()
             )));
         }
-        if !self.close_submitted {
+        if !self.close_submitted() {
             return Err(Error::InvalidState(
                 "close completion arrived before the close was submitted".to_owned(),
             ));
@@ -570,7 +644,7 @@ impl IoUringSocket {
             )));
         }
 
-        self.state = SocketState::Closed;
+        self.phase = SocketPhase::Closed;
         self.rx_buffer = None;
         self.tx_buffer = None;
         // The kernel close already released the descriptor; dropping the raw
@@ -594,8 +668,12 @@ impl IoUringSocket {
                 "{operation} completion arrived with no operation in flight"
             ))
         })?;
-        if self.in_flight_ops == 0 && matches!(self.state, SocketState::Cancelling) {
-            self.state = SocketState::Closing;
+        if self.in_flight_ops == 0 && matches!(self.state(), SocketState::Cancelling) {
+            self.phase = if self.close_requested() {
+                SocketPhase::CloseQueued
+            } else {
+                SocketPhase::CloseReady
+            };
             Ok(true)
         } else {
             Ok(false)
@@ -615,7 +693,7 @@ impl IoUringSocket {
 
 impl Drop for IoUringSocket {
     fn drop(&mut self) {
-        if self.close_submitted {
+        if self.close_submitted() {
             // The staged close operation owns the descriptor and will close it.
             // No other operation is in flight, but the buffers are abandoned
             // rather than freed so a future accounting change cannot turn this
@@ -675,5 +753,40 @@ fn fcntl_status(fd: RawFd, command: libc::c_int, argument: libc::c_int) -> Resul
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(Error::Io(error));
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle {
+    use std::os::fd::IntoRawFd;
+
+    use super::*;
+
+    #[test]
+    fn cancellation_retains_close_ownership() -> Result<()> {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair()?;
+        let mut socket = IoUringSocket::new(stream.into_raw_fd(), 64, 64)?;
+        socket.begin_connect()?;
+        assert!(!socket.request_close());
+        assert_eq!(socket.phase().superstate(), SocketSuperstate::Teardown);
+        assert!(!socket.request_close());
+        assert!(socket.connect_completed(true)?);
+        assert!(socket.rx_buffer().is_some());
+        socket.close_submission_failed()?;
+        assert!(socket.request_close());
+        assert!(!socket.request_close());
+        let fd = socket
+            .fd()
+            .ok_or_else(|| Error::InvalidState("descriptor missing".into()))?;
+        socket.close_started()?;
+        assert!(socket.close_started().is_err());
+        assert!(socket.close_submission_failed().is_err());
+        assert_eq!(socket.fd(), None);
+        // SAFETY: This test supplies the close completion and owns its descriptor.
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        socket.close_completed()?;
+        assert_eq!(socket.state(), SocketState::Closed);
+        assert!(socket.rx_buffer().is_none());
+        Ok(())
     }
 }

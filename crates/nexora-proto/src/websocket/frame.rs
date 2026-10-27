@@ -312,29 +312,36 @@ impl WebSocketCodec {
                 .map_err(|_| protocol("mask entropy unavailable"))?;
         }
         let len = frame.payload.len();
-        let mut wire = Vec::with_capacity(len.saturating_add(14));
-        wire.push((if frame.fin { 0x80 } else { 0 }) | frame.opcode as u8);
+        let mut header = [0_u8; 14];
+        header[0] = (if frame.fin { 0x80 } else { 0 }) | frame.opcode as u8;
         let mask_flag = if masked { 0x80 } else { 0 };
-        if len < 126 {
-            wire.push(mask_flag | len as u8);
+        let mut header_len = if len < 126 {
+            header[1] = mask_flag | len as u8;
+            2
         } else if len <= u16::MAX as usize {
-            wire.push(mask_flag | 126);
-            wire.extend_from_slice(&(len as u16).to_be_bytes());
+            header[1] = mask_flag | 126;
+            header[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+            4
         } else {
             let length = u64::try_from(len).map_err(|_| protocol("frame length overflow"))?;
             if length > i64::MAX as u64 {
                 return Err(protocol("frame length exceeds 63 bits"));
             }
-            wire.push(mask_flag | 127);
-            wire.extend_from_slice(&length.to_be_bytes());
-        }
+            header[1] = mask_flag | 127;
+            header[2..10].copy_from_slice(&length.to_be_bytes());
+            10
+        };
         if masked {
-            wire.extend_from_slice(&mask);
+            header[header_len..header_len + 4].copy_from_slice(&mask);
+            header_len += 4;
         }
-        for (index, &byte) in frame.payload.iter().enumerate() {
-            wire.push(if masked { byte ^ mask[index % 4] } else { byte });
+        out.reserve(header_len + len);
+        out.extend_from_slice(&header[..header_len]);
+        let start = out.len();
+        out.extend_from_slice(&frame.payload);
+        if masked {
+            Self::apply_mask(&mut out[start..], mask);
         }
-        out.extend_from_slice(&wire);
         if frame.opcode == WebSocketOpcode::Close {
             self.close_sent = true;
             self.outgoing = None;
@@ -342,6 +349,21 @@ impl WebSocketCodec {
             self.outgoing = if frame.fin { None } else { next };
         }
         Ok(())
+    }
+
+    /// Applies the RFC 6455 XOR mask to a payload starting at mask offset zero.
+    /// The same operation unmasks a received payload. No alignment is required.
+    pub fn apply_mask(payload: &mut [u8], mask: [u8; 4]) {
+        let key = u64::from_ne_bytes([
+            mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
+        ]);
+        let (chunks, tail) = payload.as_chunks_mut::<8>();
+        for chunk in chunks {
+            *chunk = (u64::from_ne_bytes(*chunk) ^ key).to_ne_bytes();
+        }
+        for (index, byte) in tail.iter_mut().enumerate() {
+            *byte ^= mask[index & 3];
+        }
     }
 
     /// Consumes complete frames until a message or control frame is available.
@@ -509,9 +531,7 @@ impl WebSocketCodec {
         }
         let mut payload = src[header_len..consumed].to_vec();
         if masked {
-            for (index, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[index % 4];
-            }
+            Self::apply_mask(&mut payload, mask);
         }
         let frame = WebSocketFrame {
             fin,
@@ -649,5 +669,28 @@ fn validate_utf8(previous: &[u8], mut data: &[u8], fin: bool) -> Result<([u8; 4]
             Ok((tail, suffix.len()))
         }
         Err(error) => Err(ProtoError::InvalidUtf8(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod mask_scenarios {
+    use super::WebSocketCodec;
+    #[test]
+    fn mask_handles_unaligned_tails() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        let mut hello = *b"Hello";
+        WebSocketCodec::apply_mask(&mut hello, mask);
+        assert_eq!(hello, [0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+        for offset in 0..8 {
+            for len in 0..130 {
+                let mut bytes = [0x5a; 144];
+                WebSocketCodec::apply_mask(&mut bytes[offset..offset + len], mask);
+                for i in 0..len {
+                    assert_eq!(bytes[offset + i], 0x5a ^ mask[i % 4]);
+                }
+                WebSocketCodec::apply_mask(&mut bytes[offset..offset + len], mask);
+                assert_eq!(bytes, [0x5a; 144]);
+            }
+        }
     }
 }

@@ -151,15 +151,20 @@ impl OriginPool {
     /// # Panics
     /// This function does not panic.
     pub fn set_state(&mut self, key: &OriginKey, state: OriginState) -> bool {
-        let entry = self.entry(key);
-        if !entry.state.can_transition_to(state) {
-            return false;
+        fn transition(entry: &mut OriginEntry, state: OriginState) -> bool {
+            if !entry.state.can_transition_to(state) {
+                return false;
+            }
+            if entry.state == OriginState::ResolvingDns && state != OriginState::ResolvingDns {
+                entry.query_handles.clear();
+            }
+            entry.state = state;
+            true
         }
-        if entry.state == OriginState::ResolvingDns && state != OriginState::ResolvingDns {
-            entry.query_handles.clear();
+        if let Some(entry) = self.origins.get_mut(key) {
+            return transition(entry, state);
         }
-        entry.state = state;
-        true
+        transition(self.entry(key), state)
     }
 
     /// Prepares a fresh lookup for `key`.

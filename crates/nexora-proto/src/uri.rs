@@ -1,6 +1,6 @@
 //! Absolute HTTP and WebSocket URIs and relative redirect resolution.
 
-use std::net::Ipv6Addr;
+use std::{fmt::Write, net::Ipv6Addr};
 
 use crate::error::{ProtoError, Result};
 
@@ -107,12 +107,22 @@ impl Uri {
             path_and_query,
             serialized: String::new(),
         };
-        uri.serialized = format!(
-            "{}://{}{}",
-            uri.scheme.as_str(),
-            uri.authority(),
-            uri.path_and_query
-        );
+        let mut serialized = String::with_capacity(raw.len() + 1);
+        serialized.push_str(uri.scheme.as_str());
+        serialized.push_str("://");
+        if uri.host.contains(':') {
+            serialized.push('[');
+        }
+        serialized.push_str(&uri.host);
+        if uri.host.contains(':') {
+            serialized.push(']');
+        }
+        if uri.explicit_port {
+            write!(&mut serialized, ":{}", uri.port)
+                .map_err(|_| invalid("URI formatting failed"))?;
+        }
+        serialized.push_str(&uri.path_and_query);
+        uri.serialized = serialized;
         Ok(uri)
     }
 
@@ -150,16 +160,13 @@ impl Uri {
 
     /// Returns the authority, retaining explicit ports and IPv6 brackets.
     pub fn authority(&self) -> String {
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        if self.explicit_port {
-            format!("{host}:{}", self.port)
-        } else {
-            host
-        }
+        self.authority_str().to_owned()
+    }
+
+    /// Borrows the normalized authority, including brackets and explicit port.
+    pub fn authority_str(&self) -> &str {
+        let start = self.scheme.as_str().len() + 3;
+        &self.serialized[start..self.serialized.len() - self.path_and_query.len()]
     }
 
     /// Returns the normalized absolute URI without a fragment.
@@ -270,6 +277,16 @@ fn validate_target(target: &str) -> Result<()> {
 }
 
 fn parse_authority(authority: &str, scheme: Scheme) -> Result<(String, u16, bool)> {
+    let (host, port, explicit) = authority_parts(authority, scheme)?;
+    Ok((host.to_ascii_lowercase(), port, explicit))
+}
+
+pub(crate) fn validate_authority(authority: &str) -> Result<()> {
+    validate_reference(authority)?;
+    authority_parts(authority, Scheme::Http).map(|_| ())
+}
+
+fn authority_parts(authority: &str, scheme: Scheme) -> Result<(&str, u16, bool)> {
     if authority.is_empty() || authority.contains('@') {
         return Err(invalid("authority is empty or contains user information"));
     }
@@ -316,7 +333,7 @@ fn parse_authority(authority: &str, scheme: Scheme) -> Result<(String, u16, bool
         Some(_) => return Err(invalid("port must contain decimal digits")),
         None => scheme.default_port(),
     };
-    Ok((host.to_ascii_lowercase(), port, explicit_port))
+    Ok((host, port, explicit_port))
 }
 
 fn normalize_target(target: &str) -> String {

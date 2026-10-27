@@ -119,12 +119,24 @@ impl Default for PoolConfig {
     }
 }
 
+/// Shared lifecycle guards for origin connection phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OriginSuperstate {
+    Idle,
+    Establishing,
+    Ready,
+    Draining,
+    Closed,
+}
+
 /// Lifecycle of one origin inside the pool.
 ///
 /// The state is per origin, not per connection: an origin may already be
 /// [`OriginState::ReadyHttp1`] while another of its connections is still
 /// [`OriginState::Connecting`] or [`OriginState::Handshaking`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum OriginState {
     #[default]
     Idle,
@@ -143,40 +155,33 @@ impl OriginState {
     /// [`OriginState::Idle`] accepts every state because a fresh origin may
     /// begin at any phase, and an origin whose connections were opened in
     /// parallel can already be ready while another connection completes.
-    /// A resolving origin must pass through [`OriginState::Connecting`], and a
-    /// closed or draining origin cannot jump straight to a ready state, so a
-    /// late completion cannot resurrect a shut-down origin.
+    /// A resolving origin must pass through [`OriginState::Connecting`]. Closed
+    /// origins reject ready completions; draining origins may still accept a
+    /// parallel handshake that was already admitted.
     ///
     /// # Errors
     /// This function does not return errors.
     ///
     /// # Panics
     /// This function does not panic.
-    pub fn can_transition_to(self, next: Self) -> bool {
-        use OriginState::{
-            Closed, Connecting, Draining, Handshaking, Idle, ReadyHttp1, ReadyHttp2, ResolvingDns,
-        };
-        match self {
-            Idle => true,
-            ResolvingDns => matches!(next, ResolvingDns | Connecting | Idle | Closed),
-            Connecting => matches!(
-                next,
-                Connecting | Handshaking | ReadyHttp1 | ReadyHttp2 | Idle | Closed | Draining
-            ),
-            Handshaking => matches!(
-                next,
-                Handshaking | Connecting | ReadyHttp1 | ReadyHttp2 | Idle | Closed | Draining
-            ),
-            ReadyHttp1 | ReadyHttp2 => matches!(
-                next,
-                ReadyHttp1 | ReadyHttp2 | Handshaking | Connecting | Idle | Closed | Draining
-            ),
-            Draining => matches!(
-                next,
-                Draining | Handshaking | ReadyHttp1 | ReadyHttp2 | Idle | Closed
-            ),
-            Closed => matches!(next, Closed | Idle | Connecting | ResolvingDns | Draining),
-        }
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        const TRANSITIONS: [u8; 8] = [0xff, 0x87, 0xfd, 0xfd, 0xfd, 0xfd, 0xf9, 0xc7];
+        TRANSITIONS[self as usize] & (1 << next as u8) != 0
+    }
+
+    /// Returns the shared lifecycle guard for this origin phase.
+    pub const fn superstate(self) -> OriginSuperstate {
+        const PARENTS: [OriginSuperstate; 8] = [
+            OriginSuperstate::Idle,
+            OriginSuperstate::Establishing,
+            OriginSuperstate::Establishing,
+            OriginSuperstate::Establishing,
+            OriginSuperstate::Ready,
+            OriginSuperstate::Ready,
+            OriginSuperstate::Draining,
+            OriginSuperstate::Closed,
+        ];
+        PARENTS[self as usize]
     }
 }
 
@@ -744,5 +749,39 @@ mod tests {
         close_fd(fd);
         close_fd(peer);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod state_lifecycle {
+    use super::{OriginState, OriginSuperstate};
+
+    #[test]
+    fn transitions_preserve_parallel_connections() {
+        use OriginState::*;
+        let states = [
+            Idle,
+            ResolvingDns,
+            Connecting,
+            Handshaking,
+            ReadyHttp1,
+            ReadyHttp2,
+            Draining,
+            Closed,
+        ];
+        let allowed = [0xff_u8, 0x87, 0xfd, 0xfd, 0xfd, 0xfd, 0xf9, 0xc7];
+        for (row, state) in states.into_iter().enumerate() {
+            for (column, next) in states.into_iter().enumerate() {
+                assert_eq!(
+                    state.can_transition_to(next),
+                    allowed[row] & (1 << column) != 0,
+                    "{state:?} -> {next:?}"
+                );
+            }
+        }
+        assert_eq!(ReadyHttp2.superstate(), OriginSuperstate::Ready);
+        assert_eq!(Handshaking.superstate(), OriginSuperstate::Establishing);
+        assert!(!Closed.can_transition_to(ReadyHttp1));
+        assert!(!ResolvingDns.can_transition_to(ReadyHttp2));
     }
 }

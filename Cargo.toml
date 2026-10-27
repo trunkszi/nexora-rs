@@ -10,6 +10,7 @@ license = "MIT"
 repository = "https://github.com/trunkszi/nexora-rs"
 
 [workspace.dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 nexora-proto = { version = "0.0.1", path = "crates/nexora-proto" }
 nexora-macros = { version = "0.0.1", path = "crates/nexora-macros" }
 nexora = { path = "crates/nexora" }
