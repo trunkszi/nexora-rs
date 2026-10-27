@@ -19,3 +19,13 @@ base64 = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "proto_hotpath_bench"
+harness = false
+
+[lib]
+bench = false

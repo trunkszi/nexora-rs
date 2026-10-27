@@ -38,14 +38,14 @@ impl WebSocketClient {
             TAG_CLOSE => {
                 owned.close_op = None;
                 owned.fd = -1;
-                owned.state = State::Closed;
+                owned.phase = SessionPhase::Closed;
             }
             TAG_CONNECT_TIMEOUT | TAG_PING_TIMEOUT => {
                 self.on_timer(&mut owned, tag, completion.result)
             }
             _ => {}
         }
-        if owned.state != State::Closed || owned.inflight != 0 {
+        if owned.phase != SessionPhase::Closed || owned.inflight != 0 {
             self.sessions.insert(id, owned);
         } else {
             self.handlers.remove(&id);
@@ -62,7 +62,7 @@ impl WebSocketClient {
         if let Some(op) = session.timer_op.take() {
             session.cancels.push(op);
         }
-        if session.teardown {
+        if session.phase.is_teardown() {
             return;
         }
         if result < 0 {
@@ -81,7 +81,7 @@ impl WebSocketClient {
         match TlsSession::new_client(&config, &host) {
             Ok(tls) => {
                 session.tls = Some(tls);
-                session.state = State::Handshaking;
+                session.phase = SessionPhase::Handshaking;
                 self.drain_tls(session);
             }
             Err(error) => self.fail(session, Error::Proto(error)),
@@ -91,7 +91,7 @@ impl WebSocketClient {
     /// Handles a receive completion and advances the protocol machines.
     fn on_recv(&mut self, session: &mut Session, result: i32) {
         session.recv_op = None;
-        if session.teardown {
+        if session.phase.is_teardown() {
             return;
         }
         if result <= 0 {
@@ -129,14 +129,14 @@ impl WebSocketClient {
             return self.fail(session, Error::Proto(error));
         }
         self.drain_tls(session);
-        if session.state == State::Handshaking
+        if session.phase == SessionPhase::Handshaking
             && session
                 .tls
                 .as_ref()
                 .is_some_and(|tls| !tls.is_handshaking())
         {
             self.finish_handshake(session);
-            if session.teardown {
+            if session.phase.is_teardown() {
                 return;
             }
         }
@@ -147,7 +147,7 @@ impl WebSocketClient {
     fn on_send(&mut self, session: &mut Session, result: i32) {
         session.send_op = None;
         if result < 0 {
-            if !session.teardown {
+            if !session.phase.is_teardown() {
                 self.fail(session, Error::Io(io_error(result)));
             }
             return;
@@ -169,17 +169,17 @@ impl WebSocketClient {
     fn on_timer(&mut self, session: &mut Session, tag: u64, result: i32) {
         drop(session.timer.take());
         session.timer_op = None;
-        if session.teardown || result != -libc::ETIME {
+        if session.phase.is_teardown() || result != -libc::ETIME {
             return;
         }
         match tag {
-            TAG_CONNECT_TIMEOUT if session.state == State::Connecting => {
+            TAG_CONNECT_TIMEOUT if session.phase == SessionPhase::Connecting => {
                 if let Some(op) = session.connect_op.take() {
                     session.cancels.push(op);
                 }
                 self.fail(session, Error::Timeout);
             }
-            TAG_PING_TIMEOUT if session.state == State::Open && !session.closing => {
+            TAG_PING_TIMEOUT if session.phase == SessionPhase::Open => {
                 if let Err(error) = session.queue_message(WebSocketMessage::Ping(Bytes::new())) {
                     self.fail(session, Error::Proto(error));
                 }
@@ -214,12 +214,12 @@ impl WebSocketClient {
         if let Err(error) = encoded {
             return self.fail(session, Error::Proto(error));
         }
-        session.state = State::Upgrading;
+        session.phase = SessionPhase::Upgrading;
     }
 
     /// Advances the HTTP upgrade or WebSocket message state machine.
     fn advance(&mut self, session: &mut Session) {
-        if session.state == State::Upgrading {
+        if session.phase == SessionPhase::Upgrading {
             let mut http = Http1ClientCodec::default();
             match http.decode_response(&mut session.plain, Method::Get) {
                 Ok(Some((response, Http1KeepAlive::Upgrade))) => {
@@ -228,7 +228,7 @@ impl WebSocketClient {
                     {
                         return self.fail(session, Error::Proto(error));
                     }
-                    session.state = State::Open;
+                    session.phase = SessionPhase::Open;
                     if let Some(callback) = session.on_open.take() {
                         let mut ctx = client_context(&self.inbox);
                         callback(&mut ctx, session.id, Ok(()));
@@ -249,7 +249,7 @@ impl WebSocketClient {
         // Once either side has started the close handshake, further bytes are
         // not application data; decoding them would turn a peer's trailing junk
         // into a protocol failure that aborts the close reply still to be sent.
-        if session.state != State::Open || session.closing {
+        if session.phase != SessionPhase::Open {
             return;
         }
         loop {
@@ -262,7 +262,7 @@ impl WebSocketClient {
                 }
                 Err(error) => return self.fail(session, Error::Proto(error)),
             }
-            if session.state != State::Open || session.teardown {
+            if session.phase != SessionPhase::Open {
                 return;
             }
         }
@@ -291,8 +291,8 @@ impl WebSocketClient {
                         .map_or(WebSocketCloseCode::Normal, |frame| frame.code),
                     reason: String::new(),
                 };
-                let reply = !session.closing;
-                session.closing = true;
+                let reply = !session.phase.is_closing();
+                session.phase = SessionPhase::CloseFlush;
                 self.emit(session, WebSocketEvent::Close(close));
                 if reply
                     && let Err(error) = session.queue_message(WebSocketMessage::Close(Some(echo)))
@@ -307,11 +307,8 @@ impl WebSocketClient {
 
     /// Delivers one event to the registered sink.
     fn emit(&mut self, session: &mut Session, event: WebSocketEvent) {
-        if matches!(event, WebSocketEvent::Close(_)) {
-            if session.close_event_sent {
-                return;
-            }
-            session.close_event_sent = true;
+        if matches!(event, WebSocketEvent::Close(_)) && !session.phase.notify_close() {
+            return;
         }
         let id = session.id;
         let Some(handler) = self.handlers.get_mut(&id) else {
@@ -324,7 +321,7 @@ impl WebSocketClient {
 
     /// Reports a terminal error and starts teardown.
     pub(super) fn fail(&mut self, session: &mut Session, error: Error) {
-        if session.teardown {
+        if session.phase.is_teardown() {
             return;
         }
         match session.on_open.take() {
@@ -338,8 +335,7 @@ impl WebSocketClient {
         if let Some(lookup) = session.lookup.take() {
             self.dns_waiters.remove(&lookup);
         }
-        session.teardown = true;
-        session.closing = true;
+        session.phase.begin_teardown();
     }
 
     /// Stages pending cancels, sends, receives, timers, and teardown work.
@@ -352,7 +348,7 @@ impl WebSocketClient {
             {
                 failure = Some(error);
             }
-            if session.state != State::Closed || session.inflight != 0 {
+            if session.phase != SessionPhase::Closed || session.inflight != 0 {
                 self.sessions.insert(id, session);
             } else {
                 self.handlers.remove(&id);
@@ -366,44 +362,43 @@ impl WebSocketClient {
 
     /// Stages the next operation for one session.
     fn pump_session(&mut self, session: &mut Session, proactor: &mut Proactor) -> Result<()> {
-        if session.state == State::Closed {
+        if session.phase == SessionPhase::Closed {
             return Ok(());
         }
         self.stage_cancels(session, proactor)?;
-        if session.teardown {
+        if session.phase.is_teardown() {
             return self.pump_close(session, proactor);
         }
         if session.send_op.is_none() && !session.wire.is_empty() {
             self.stage_send(session, proactor)?;
         }
         let framed = matches!(
-            session.state,
-            State::Handshaking | State::Upgrading | State::Open
+            session.phase,
+            SessionPhase::Handshaking | SessionPhase::Upgrading | SessionPhase::Open
         );
         // A closing session needs no more peer bytes: the remaining work is the
         // close reply already on the wire, and continuing to receive would grow
         // `plain` with data that the codec must reject.
-        if framed && !session.closing && session.recv_op.is_none() {
+        if framed && session.recv_op.is_none() {
             self.stage_recv(session, proactor)?;
         }
         let keepalive = self
             .config
             .ping_interval
             .is_some_and(|interval| !interval.is_zero());
-        if session.state == State::Open
+        if session.phase == SessionPhase::Open
             && keepalive
-            && !session.closing
             && session.timer.is_none()
             && session.timer_op.is_none()
         {
             self.stage_ping_timer(session, proactor)?;
         }
-        if session.closing
+        if session.phase.is_closing()
             && session.send_op.is_none()
             && session.wire.is_empty()
             && session.deferred.is_empty()
         {
-            session.teardown = true;
+            session.phase.begin_teardown();
             self.pump_close(session, proactor)?;
         }
         Ok(())
@@ -450,7 +445,7 @@ impl WebSocketClient {
         }
         if session.fd < 0 || session.close_op.is_some() {
             if session.close_op.is_none() {
-                session.state = State::Closed;
+                session.phase = SessionPhase::Closed;
             }
             return Ok(());
         }
@@ -582,7 +577,7 @@ impl WebSocketClient {
             }
             if let Some(addr) = addrs.first().copied() {
                 owned.lookup = None;
-                owned.state = State::Connecting;
+                owned.phase = SessionPhase::Connecting;
                 self.sessions.insert(id, owned);
                 self.dns_waiters.remove(&lookup);
                 // The drive loop has no caller to return this error to, so the

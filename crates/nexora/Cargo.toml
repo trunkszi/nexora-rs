@@ -17,7 +17,15 @@ nexora-proto = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 rustls = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "runtime_hsm_bench"
+harness = false
+
+[lib]
+bench = false

@@ -29,7 +29,7 @@ use nexora_proto::{
     TlsSession, Uri, WebSocketCloseCode, WebSocketCloseFrame, WebSocketCodec, WebSocketConfig,
     WebSocketHandshake, WebSocketMessage, WebSocketRole,
 };
-use session::{DnsOutcome, Session, State};
+use session::{DnsOutcome, Session, SessionPhase};
 
 use crate::{
     error::{Error, Result},
@@ -274,7 +274,7 @@ impl WebSocketClient {
                 .map(|ip| SocketAddr::new(ip, port)),
         };
         if let Some(addr) = addr {
-            session.state = State::Connecting;
+            session.phase = SessionPhase::Connecting;
             self.sessions.insert(id, session);
             if let Err(error) = self.begin_connect(proactor, id, addr) {
                 drop(self.sessions.remove(&id));
@@ -441,7 +441,7 @@ impl WebSocketClient {
     pub fn is_open(&self, session: WebSocketSessionId) -> bool {
         self.sessions
             .get(&session)
-            .is_some_and(|owned| owned.state == State::Open && !owned.closing && !owned.teardown)
+            .is_some_and(|owned| owned.phase == SessionPhase::Open)
     }
     /// Returns the number of sessions still tracked by this client.
     /// # Panics
@@ -461,7 +461,7 @@ impl WebSocketClient {
         let Some(mut owned) = self.sessions.remove(&session) else {
             return Err(invalid("unknown WebSocket session"));
         };
-        let allowed = owned.state == State::Open && !owned.closing && !owned.teardown;
+        let allowed = owned.phase == SessionPhase::Open;
         let result = if allowed {
             owned.queue_message(message).map_err(Error::Proto)
         } else {
@@ -502,12 +502,12 @@ impl WebSocketClient {
         let Some(mut owned) = self.sessions.remove(&session) else {
             return;
         };
-        if owned.state == State::Open && !owned.closing && !owned.teardown {
+        if owned.phase == SessionPhase::Open {
             let closing = matches!(message, WebSocketMessage::Close(_));
             if let Err(error) = owned.queue_message(message) {
                 self.fail(&mut owned, Error::Proto(error));
             } else if closing {
-                owned.closing = true;
+                owned.phase = SessionPhase::CloseFlush;
             }
         }
         self.sessions.insert(session, owned);
@@ -519,10 +519,10 @@ impl WebSocketClient {
         // A repeated close request is idempotent: the handshake is already
         // running, and a request from inside the peer-close callback must not
         // abort the reply frame that is about to be queued.
-        if !owned.teardown && !owned.closing {
-            if owned.state == State::Open {
+        if !owned.phase.is_teardown() && !owned.phase.is_closing() {
+            if owned.phase == SessionPhase::Open {
                 match owned.queue_message(WebSocketMessage::Close(close)) {
-                    Ok(()) => owned.closing = true,
+                    Ok(()) => owned.phase = SessionPhase::CloseFlush,
                     Err(error) => self.fail(&mut owned, Error::Proto(error)),
                 }
             } else {
@@ -635,7 +635,7 @@ impl WebSocketClient {
         owned.peer = Some(peer);
         owned.connect_op = Some(op);
         owned.inflight += 1;
-        owned.state = State::Connecting;
+        owned.phase = SessionPhase::Connecting;
         // A missing deadline must not lose the staged connect, so failure to
         // arm the timer only leaves the session without a connect timeout.
         if let Ok(timeout) = Timeout::new(self.config.connect_timeout) {

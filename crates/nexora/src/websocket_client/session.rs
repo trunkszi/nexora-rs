@@ -2,15 +2,75 @@
 
 use super::*;
 
-/// Connection state of one WebSocket session.
+/// Shared guards for session establishment, delivery and terminal drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum State {
+#[repr(u8)]
+pub(super) enum SessionSuperstate {
+    Connecting,
+    Open,
+    Closing,
+    Closed,
+}
+
+/// Close notification and cancellation are substates, so a callback cannot
+/// reopen application delivery while a close reply still owns wire bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum SessionPhase {
     Resolving,
     Connecting,
     Handshaking,
     Upgrading,
     Open,
+    CloseFlush,
+    CloseNotified,
+    Teardown,
+    TeardownNotified,
     Closed,
+}
+impl SessionPhase {
+    pub(super) const fn superstate(self) -> SessionSuperstate {
+        match self {
+            Self::Resolving | Self::Connecting | Self::Handshaking | Self::Upgrading => {
+                SessionSuperstate::Connecting
+            }
+            Self::Open => SessionSuperstate::Open,
+            Self::Closed => SessionSuperstate::Closed,
+            Self::CloseFlush | Self::CloseNotified | Self::Teardown | Self::TeardownNotified => {
+                SessionSuperstate::Closing
+            }
+        }
+    }
+    pub(super) const fn is_closing(self) -> bool {
+        matches!(
+            self.superstate(),
+            SessionSuperstate::Closing | SessionSuperstate::Closed
+        )
+    }
+    pub(super) const fn is_teardown(self) -> bool {
+        matches!(self, Self::Teardown | Self::TeardownNotified | Self::Closed)
+    }
+    pub(super) fn begin_teardown(&mut self) {
+        *self = if matches!(self, Self::CloseNotified | Self::TeardownNotified) {
+            Self::TeardownNotified
+        } else {
+            Self::Teardown
+        };
+    }
+    pub(super) fn notify_close(&mut self) -> bool {
+        if matches!(
+            self,
+            Self::CloseNotified | Self::TeardownNotified | Self::Closed
+        ) {
+            return false;
+        }
+        *self = if self.is_teardown() {
+            Self::TeardownNotified
+        } else {
+            Self::CloseNotified
+        };
+        true
+    }
 }
 
 /// One completed family query: lookup ticket, addresses, failure text.
@@ -20,7 +80,7 @@ pub(super) type DnsOutcome = (u64, Vec<SocketAddr>, Option<String>);
 pub(super) struct Session {
     pub(super) id: WebSocketSessionId,
     pub(super) uri: Uri,
-    pub(super) state: State,
+    pub(super) phase: SessionPhase,
     pub(super) fd: RawFd,
     pub(super) peer: Option<Box<PeerAddr>>,
     pub(super) tls: Option<TlsSession>,
@@ -39,9 +99,6 @@ pub(super) struct Session {
     pub(super) timer: Option<Timeout>,
     pub(super) timer_op: Option<OperationId>,
     pub(super) inflight: usize,
-    pub(super) closing: bool,
-    pub(super) teardown: bool,
-    pub(super) close_event_sent: bool,
     pub(super) lookup: Option<u64>,
     pub(super) dns_left: u8,
     pub(super) dns_reason: Option<String>,
@@ -66,7 +123,7 @@ impl Session {
         Self {
             id,
             uri,
-            state: State::Resolving,
+            phase: SessionPhase::Resolving,
             fd: -1,
             peer: None,
             tls: None,
@@ -85,9 +142,6 @@ impl Session {
             timer: None,
             timer_op: None,
             inflight: 0,
-            closing: false,
-            teardown: false,
-            close_event_sent: false,
             lookup: None,
             dns_left: 0,
             dns_reason: None,

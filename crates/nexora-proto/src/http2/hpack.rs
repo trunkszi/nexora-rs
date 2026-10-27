@@ -208,14 +208,13 @@ impl HpackEncoder {
             }
         }
         for (name, value) in headers {
-            let sensitive = [
-                "authorization",
-                "proxy-authorization",
-                "cookie",
-                "set-cookie",
-            ]
-            .iter()
-            .any(|field| name.eq_ignore_ascii_case(field));
+            let sensitive = match name.len() {
+                6 => name.eq_ignore_ascii_case("cookie"),
+                10 => name.eq_ignore_ascii_case("set-cookie"),
+                13 => name.eq_ignore_ascii_case("authorization"),
+                19 => name.eq_ignore_ascii_case("proxy-authorization"),
+                _ => false,
+            };
             if !sensitive && let Some(index) = self.table.find(name, Some(value)) {
                 encode_integer(index, 7, 0x80, out);
                 continue;

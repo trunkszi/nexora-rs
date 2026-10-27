@@ -9,21 +9,26 @@ use super::{
 use crate::{Bytes, BytesMut, Headers, ProtoError, Result, Uri};
 
 /// HTTP/1 client encoder and response decoder.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Http1ClientCodec {
     config: Http1ClientConfig,
     encode_closed: bool,
     decode_closed: bool,
+    head: String,
+}
+
+impl std::fmt::Debug for Http1ClientCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http1ClientCodec")
+            .field("config", &self.config)
+            .field("encode_closed", &self.encode_closed)
+            .field("decode_closed", &self.decode_closed)
+            .finish()
+    }
 }
 
 impl Http1ClientCodec {
     /// Creates a codec with bounded header and body reassembly.
-    ///
-    /// # Errors
-    /// This operation does not return errors.
-    ///
-    /// # Panics
-    /// This operation does not panic.
     pub fn new(config: Http1ClientConfig) -> Self {
         Self {
             config,
@@ -38,9 +43,6 @@ impl Http1ClientCodec {
     /// Returns an error for invalid fields, ambiguous framing, configured limits,
     /// or a closed or upgraded direction.
     /// The output remains unchanged on error.
-    ///
-    /// # Panics
-    /// This operation does not panic.
     pub fn encode_request(&mut self, req: &Request, out: &mut BytesMut) -> Result<()> {
         check_open(self.encode_closed || self.decode_closed)?;
         check_body_size(req.body.len(), self.config.max_request_body_size)?;
@@ -62,16 +64,18 @@ impl Http1ClientCodec {
         if target.is_empty() || target.bytes().any(|byte| byte <= b' ' || byte == 127) {
             return Err(protocol("invalid request target"));
         }
-        let mut head = format!("{} {target} {version}\r\n", req.method.as_str());
-        encode_headers(&req.headers, &mut head)?;
+        self.head.clear();
+        let head = &mut self.head;
+        write!(head, "{} {target} {version}\r\n", req.method.as_str()).map_err(format_error)?;
+        encode_headers(&req.headers, head)?;
         if !req.headers.contains("host") {
-            let authority = req.uri.authority();
-            validate_value(&authority)?;
+            let authority = req.uri.authority_str();
+            validate_value(authority)?;
             write!(head, "host: {authority}\r\n").map_err(format_error)?;
         }
         let framing = framing(&req.headers, req.version)?;
         validate_upgrade_framing(&req.headers, framing, req.body.len())?;
-        append_length(&mut head, framing, req.body.len())?;
+        append_length(head, framing, req.body.len())?;
         head.push_str("\r\n");
         check_header_size(head.len(), self.config.max_header_list_size)?;
         append_message(head.as_bytes(), req.body.as_ref(), framing, out);
@@ -87,9 +91,6 @@ impl Http1ClientCodec {
     /// or upgraded receive direction. Input is
     /// unchanged on error. Responses requiring transport EOF are rejected because
     /// this interface has no EOF notification.
-    ///
-    /// # Panics
-    /// This operation does not panic.
     pub fn decode_response(
         &mut self,
         buf: &mut BytesMut,
@@ -162,21 +163,26 @@ impl Http1ClientCodec {
 }
 
 /// HTTP/1 server request decoder and response encoder.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Http1ServerCodec {
     config: Http1ServerConfig,
     encode_closed: bool,
     decode_closed: bool,
+    head: String,
+}
+
+impl std::fmt::Debug for Http1ServerCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http1ServerCodec")
+            .field("config", &self.config)
+            .field("encode_closed", &self.encode_closed)
+            .field("decode_closed", &self.decode_closed)
+            .finish()
+    }
 }
 
 impl Http1ServerCodec {
     /// Creates a codec with bounded header and body reassembly.
-    ///
-    /// # Errors
-    /// This operation does not return errors.
-    ///
-    /// # Panics
-    /// This operation does not panic.
     pub fn new(config: Http1ServerConfig) -> Self {
         Self {
             config,
@@ -192,9 +198,6 @@ impl Http1ServerCodec {
     /// Returns an error for malformed messages, ambiguous framing, configured
     /// limits or a closed or upgraded direction. Input remains unchanged on errors
     /// and incomplete messages. An upgrade request cannot carry a framed body.
-    ///
-    /// # Panics
-    /// This operation does not panic.
     pub fn decode_request(
         &mut self,
         buf: &mut BytesMut,
@@ -254,9 +257,6 @@ impl Http1ServerCodec {
     /// # Errors
     /// Returns an error for invalid fields, ambiguous framing, configured
     /// limits or a closed or upgraded send direction. Output is unchanged on error.
-    ///
-    /// # Panics
-    /// This operation does not panic.
     pub fn encode_response(&mut self, resp: &Response, out: &mut BytesMut) -> Result<()> {
         check_open(self.encode_closed)?;
         check_body_size(resp.body.len(), self.config.max_body_size)?;
@@ -268,16 +268,20 @@ impl Http1ServerCodec {
         if (bodyless || resp.status.as_u16() == 205) && !resp.body.is_empty() {
             return Err(protocol("status does not permit a response body"));
         }
-        let mut head = format!(
+        self.head.clear();
+        let head = &mut self.head;
+        write!(
+            head,
             "{version} {} {}\r\n",
             resp.status.as_u16(),
             resp.status.reason_phrase()
-        );
-        encode_headers(&resp.headers, &mut head)?;
+        )
+        .map_err(format_error)?;
+        encode_headers(&resp.headers, head)?;
         let message_framing = framing(&resp.headers, resp.version)?;
         validate_status_framing(resp.status, message_framing)?;
         if !bodyless {
-            append_length(&mut head, message_framing, resp.body.len())?;
+            append_length(head, message_framing, resp.body.len())?;
         }
         head.push_str("\r\n");
         check_header_size(head.len(), self.config.max_header_list_size)?;
@@ -354,12 +358,23 @@ fn check_body_size(size: usize, max: usize) -> Result<()> {
     Ok(())
 }
 
+fn find_crlf<const N: usize>(data: &[u8], delimiter: &[u8; N]) -> Option<usize> {
+    let mut cursor = 0;
+    while let Some(offset) = data[cursor..].iter().position(|byte| *byte == b'\r') {
+        let at = cursor + offset;
+        if data[at..].starts_with(delimiter) {
+            return Some(at);
+        }
+        cursor = at + 1;
+    }
+    None
+}
 fn line_end(data: &[u8]) -> Option<usize> {
-    data.windows(2).position(|pair| pair == b"\r\n")
+    find_crlf(data, b"\r\n")
 }
 
-fn parse_head(data: &[u8], max: usize) -> Result<Option<(String, Headers, usize)>> {
-    let Some(end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+fn parse_head(data: &[u8], max: usize) -> Result<Option<(&str, Headers, usize)>> {
+    let Some(end) = find_crlf(data, b"\r\n\r\n") else {
         check_header_size(data.len(), max)?;
         return Ok(None);
     };
@@ -377,10 +392,16 @@ fn parse_head(data: &[u8], max: usize) -> Result<Option<(String, Headers, usize)
         let (name, value) = parse_field(line)?;
         headers.append(name, value);
     }
-    if headers.get_all("host").len() > 1 {
+    if headers
+        .iter()
+        .filter(|field| field.name == "host")
+        .take(2)
+        .count()
+        > 1
+    {
         return Err(protocol("multiple Host fields"));
     }
-    Ok(Some((first.into(), headers, head_len)))
+    Ok(Some((first, headers, head_len)))
 }
 
 fn is_token(byte: u8) -> bool {
@@ -418,7 +439,13 @@ fn encode_headers(headers: &Headers, out: &mut String) -> Result<()> {
         validate_value(&field.value)?;
         write!(out, "{}: {}\r\n", field.name, field.value).map_err(format_error)?;
     }
-    if headers.get_all("host").len() > 1 {
+    if headers
+        .iter()
+        .filter(|field| field.name == "host")
+        .take(2)
+        .count()
+        > 1
+    {
         return Err(protocol("multiple Host fields"));
     }
     if let Some(host) = headers.get("host") {
@@ -428,18 +455,21 @@ fn encode_headers(headers: &Headers, out: &mut String) -> Result<()> {
 }
 
 fn framing(headers: &Headers, version: Version) -> Result<Framing> {
-    let lengths = headers.get_all("content-length");
-    let transfers = headers.get_all("transfer-encoding");
-    if !lengths.is_empty() && !transfers.is_empty() {
+    let lengths = headers.contains("content-length");
+    let transfers = headers.contains("transfer-encoding");
+    if lengths && transfers {
         return Err(protocol(
             "both Transfer-Encoding and Content-Length present",
         ));
     }
-    if !transfers.is_empty() {
+    if transfers {
         if version == Version::Http10 {
             return Err(protocol("HTTP/1.0 does not support Transfer-Encoding"));
         }
-        let mut tokens = transfers.iter().flat_map(|value| value.split(','));
+        let mut tokens = headers
+            .iter()
+            .filter(|field| field.name == "transfer-encoding")
+            .flat_map(|field| field.value.split(','));
         let first = tokens.next().unwrap_or_default().trim_matches([' ', '\t']);
         if !first.eq_ignore_ascii_case("chunked") || tokens.next().is_some() {
             return Err(protocol("unsupported transfer coding"));
@@ -447,7 +477,11 @@ fn framing(headers: &Headers, version: Version) -> Result<Framing> {
         return Ok(Framing::Chunked);
     }
     let mut length = None;
-    for value in lengths.iter().flat_map(|value| value.split(',')) {
+    for value in headers
+        .iter()
+        .filter(|field| field.name == "content-length")
+        .flat_map(|field| field.value.split(','))
+    {
         let value = value.trim_matches([' ', '\t']);
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(protocol("invalid Content-Length"));
@@ -515,11 +549,15 @@ fn request_uri(method: Method, target: &str, version: Version, headers: &Headers
 }
 
 fn has_token(headers: &Headers, name: &str, token: &str) -> bool {
-    headers.get_all(name).iter().any(|value| {
-        value
-            .split(',')
-            .any(|part| part.trim_matches([' ', '\t']).eq_ignore_ascii_case(token))
-    })
+    headers
+        .iter()
+        .filter(|field| field.name.eq_ignore_ascii_case(name))
+        .any(|field| {
+            field
+                .value
+                .split(',')
+                .any(|part| part.trim_matches([' ', '\t']).eq_ignore_ascii_case(token))
+        })
 }
 
 fn validate_upgrade_framing(headers: &Headers, framing: Framing, body_size: usize) -> Result<()> {
@@ -675,8 +713,7 @@ fn validate_authority(authority: &str) -> Result<()> {
     if authority.is_empty() || authority.bytes().any(|b| b"/@?#".contains(&b)) {
         return Err(ProtoError::InvalidHeader("invalid Host authority".into()));
     }
-    Uri::parse(&format!("http://{authority}/"))
-        .map(|_| ())
+    crate::uri::validate_authority(authority)
         .map_err(|_| ProtoError::InvalidHeader("invalid Host authority".into()))
 }
 
