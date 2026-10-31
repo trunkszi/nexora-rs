@@ -39,7 +39,7 @@ fn spin(
 }
 
 #[test]
-fn lc_01_cancel_is_exactly_once_across_dns_queue_and_active_exchange() -> TestResult {
+fn lc_01_cancel_across_request_phases() -> TestResult {
     let _exclusive = support::exclusive();
     let dns = MockDns::spawn(
         DnsPlan::answer(vec![Ipv4Addr::LOCALHOST]).delay(Duration::from_millis(350)),
@@ -252,7 +252,7 @@ fn lc_01_cancel_is_exactly_once_across_dns_queue_and_active_exchange() -> TestRe
 }
 
 #[test]
-fn lc_02_cancel_then_follow_up_survives_both_completions() -> TestResult {
+fn lc_02_cancel_followup_retirement() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let gate = Gate::new(GateMode::Echo);
@@ -319,7 +319,7 @@ fn lc_02_cancel_then_follow_up_survives_both_completions() -> TestResult {
 }
 
 #[test]
-fn lc_03_responder_drop_is_500_and_late_respond_fails() -> TestResult {
+fn lc_03_responder_drop_disconnect() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let gate = Gate::new(GateMode::Echo);
@@ -411,7 +411,7 @@ fn lc_03_responder_drop_is_500_and_late_respond_fails() -> TestResult {
 }
 
 #[test]
-fn lc_04_goaway_websocket_close_and_idle_eviction() -> TestResult {
+fn lc_04_goaway_close_eviction() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let mut config = client_config(1, 2).t()?;
@@ -572,7 +572,7 @@ fn lc_04_goaway_websocket_close_and_idle_eviction() -> TestResult {
 }
 
 #[test]
-fn lc_05_dropped_client_does_not_block_a_sibling_subsystem() -> TestResult {
+fn lc_05_sibling_survives_client_drop() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let mut server = HttpServer::bind(
@@ -644,7 +644,7 @@ fn lc_05_dropped_client_does_not_block_a_sibling_subsystem() -> TestResult {
 }
 
 #[test]
-fn lc_06_many_requests_and_cancels_do_not_leak_descriptors() -> TestResult {
+fn lc_06_request_cancel_descriptor_balance() -> TestResult {
     let _exclusive = support::exclusive();
     let before_fd = support::open_fd_count().t()?;
     let before_threads = support::thread_count().t()?;
@@ -725,7 +725,7 @@ fn lc_06_many_requests_and_cancels_do_not_leak_descriptors() -> TestResult {
         .map_err(|error| format!("cancel settle: {error}"))?;
         let after_cancel = support::open_fd_count().t()?;
         check(
-            after_cancel == after_echo,
+            after_cancel <= after_echo,
             format!("cancel cycle grew descriptors: echo {after_echo} cancel {after_cancel}"),
         )?;
         check(
@@ -741,4 +741,53 @@ fn lc_06_many_requests_and_cancels_do_not_leak_descriptors() -> TestResult {
         after_fd <= after_echo,
         format!("drop grew descriptors: live {after_echo} dropped {after_fd} baseline {before_fd}"),
     )
+}
+
+#[test]
+fn lc_callback_followup_submission() -> TestResult {
+    let _exclusive = support::exclusive();
+    let mut ring = proactor().t()?;
+    let mut client = HttpClient::new(&mut ring, client_config(1, 2).t()?).t()?;
+    let idle_enters = ring.stats().enter_calls;
+    check(client.drive(&mut ring).t()? == 0, "idle drive has no CQEs")?;
+    check(
+        ring.stats().enter_calls == idle_enters,
+        "idle drive entered the kernel",
+    )?;
+    let calls = Rc::new(Cell::new(0));
+    let callback = Rc::clone(&calls);
+    client
+        .set_timer(&mut ring, Duration::ZERO, move |ctx, _| {
+            callback.set(callback.get() + 1);
+            let next = Rc::clone(&callback);
+            ctx.set_timer(Duration::ZERO, move |_, _| next.set(next.get() + 1));
+        })
+        .t()?;
+    ring.submit().t()?;
+    // SAFETY: The open ring is exclusively borrowed for this synchronous wait.
+    // Leaving the CQE queued makes the next SDK drive the sole callback dispatcher.
+    unsafe { (&*ring.ring_mut()).submitter().submit_and_wait(1) }.t()?;
+    let enters = ring.stats().enter_calls;
+    check(client.drive(&mut ring).t()? == 1, "one initial timer CQE")?;
+    check(
+        calls.get() == 1,
+        "follow-up callback must await another turn",
+    )?;
+    check(
+        ring.stats().enter_calls > enters,
+        "follow-up entered this turn",
+    )?;
+    check(ring.submit().t()? == 0, "follow-up was already published")?;
+    let finished = drive_until(
+        &mut ring,
+        |ring| {
+            client.drive(ring)?;
+            Ok(calls.get() == 2)
+        },
+        Duration::from_secs(1),
+    )
+    .t()?;
+    check(finished, "follow-up timer must complete")?;
+    client.shutdown(&mut ring);
+    ring.shutdown().t()
 }

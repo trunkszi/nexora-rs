@@ -14,8 +14,8 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 nexora-proto = { version = "0.0.1", path = "crates/nexora-proto" }
 nexora-macros = { version = "0.0.1", path = "crates/nexora-macros" }
 nexora = { path = "crates/nexora" }
-liburing = { version = "0.0.1", package = "liburing-proactor" }
-cares = { version = "0.0.1" }
+liburing = { git = "https://github.com/trunkszi/liburing-rs.git", branch = "main", package = "liburing-proactor" }
+cares = { git = "https://github.com/trunkszi/cares-rs.git", branch = "main" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1" }
 rcgen = { version = "0.13" }

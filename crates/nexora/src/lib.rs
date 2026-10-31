@@ -24,8 +24,9 @@ pub use dns::{DnsCache, DnsCacheEntry, HostResolver};
 pub use error::{Error, Result};
 pub use inbox::{ClientContext, RequestId, SubsystemInbox, TimerId, WebSocketSessionId};
 pub use liburing::{
-    Completion, CompletionDispatcher, Proactor as UringProactor, Proactor, ProactorBuilder,
-    ProactorConfig, SubmissionContext, SubsystemId,
+    Completion, CompletionDispatcher, EventDrivenConfig, Proactor as UringProactor, Proactor,
+    ProactorBuilder, ProactorConfig, ProactorMode, ProactorStats, SqPollConfig, SubmissionContext,
+    SubsystemId,
 };
 pub use nexora_macros::{
     HeaderMap, RestRequest, headers, http_service, http2_headers, websocket_handler,
