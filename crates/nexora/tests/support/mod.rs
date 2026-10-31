@@ -18,9 +18,10 @@ use std::{
 #[allow(unused_imports)]
 pub use dns::{DnsAction, DnsPlan, DnsStep, MockDns};
 use nexora::{
-    AlpnProtocol, Bytes, ClientConfig, PoolConfig, Proactor, ProactorConfig, RequestContext,
-    Responder, Response, Result, ServerConfig, StatusCode, SubsystemId, TlsClientConfig,
-    TlsServerConfig, WebSocketServerSession, http_service, websocket_handler,
+    AlpnProtocol, Bytes, ClientConfig, Headers, HttpClient, HttpServer, PoolConfig, Proactor,
+    ProactorConfig, Request, RequestContext, Responder, Response, Result, ServerConfig, StatusCode,
+    SubsystemId, TlsClientConfig, TlsServerConfig, WebSocketClient, WebSocketServerSession,
+    http_service, websocket_handler,
 };
 
 /// Failure text returned by test assertions.
@@ -115,7 +116,7 @@ pub fn open_fd_count() -> io::Result<usize> {
 }
 
 /// Counts current-test and non-test tasks under `/proc/self/task`.
-/// Sibling test tasks are excluded; tasks sharing the current name are retained.
+/// Sibling test tasks and kernel io_uring tasks are excluded.
 ///
 /// # Errors
 /// Returns an I/O error when the task directory or a live task name cannot be read.
@@ -134,6 +135,9 @@ pub fn thread_count() -> io::Result<usize> {
             Err(error) => return Err(error),
         };
         let comm = comm.trim();
+        if comm.starts_with("iou-") {
+            continue;
+        }
         if comm != current
             && ["sc_", "lc_", "e2e_", "it_", "support::"]
                 .into_iter()
@@ -200,6 +204,50 @@ pub fn proactor() -> Result<Proactor> {
         ..ProactorConfig::default()
     })
     .map_err(nexora::Error::from)
+}
+
+/// Qualifies a SQPOLL ring on an allowed CPU, recording unavailable capability.
+/// # Errors
+/// Returns affinity or ring errors outside the capability skip policy.
+/// # Panics
+/// Does not panic.
+pub fn sqpoll_proactor() -> Result<Option<Proactor>> {
+    // SAFETY: An all-zero cpu_set_t is a valid empty CPU affinity mask.
+    let mut allowed = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    // SAFETY: allowed is writable for its full size; pid zero selects this thread.
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&allowed), &mut allowed) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: allowed is an initialized CPU mask returned by sched_getaffinity.
+    let single_cpu = unsafe { libc::CPU_COUNT(&allowed) } == 1;
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        .rev()
+        .find(|&cpu| {
+            // SAFETY: cpu is in CPU_SETSIZE and allowed is initialized.
+            unsafe { libc::CPU_ISSET(cpu, &allowed) }
+        })
+        .ok_or_else(|| io::Error::other("no allowed CPU for SQPOLL qualification"))?;
+    let polling = nexora::SqPollConfig::pinned(cpu as u32).with_idle_ms(std::num::NonZeroU32::MIN);
+    match Proactor::new(ProactorConfig {
+        mode: nexora::ProactorMode::SqPoll(polling),
+        ..ProactorConfig::default()
+    }) {
+        Ok(ring) => Ok(Some(ring)),
+        Err(liburing::UringError::RingInit(errno))
+            if matches!(
+                errno.abs(),
+                libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL
+            ) =>
+        {
+            eprintln!("SQPOLL qualification skipped: ring initialization errno {errno}");
+            Ok(None)
+        }
+        Err(liburing::UringError::InvalidConfig(reason)) if single_cpu => {
+            eprintln!("SQPOLL qualification skipped: {reason}");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Client configuration pinned to explicit subsystem ids.
@@ -600,4 +648,108 @@ pub fn ephemeral() -> SocketAddr {
 #[must_use]
 pub fn ipv4_loopback() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+/// Runs HTTP/1, HTTP/2, and WebSocket exchanges on one supplied ring.
+/// # Errors
+/// Returns an exchange, dispatch, or resource-count failure.
+/// # Panics
+/// Does not panic.
+pub fn shared_port_exchange(ring: &mut Proactor) -> TestResult {
+    let echo = WebSocketEcho::new();
+    let texts = echo.texts();
+    let config = server_config(3).t()?;
+    let mut server = HttpServer::bind(ring, ephemeral(), config, Gate::new(GateMode::Echo))
+        .t()?
+        .with_websocket_handler("/stream", echo);
+    let port = server.local_addr().port();
+    let mut http1 = HttpClient::new(ring, client_config(1, 2).t()?).t()?;
+    let http_slot = Slot::new();
+    let http_done = http_slot.clone();
+    http1
+        .submit(
+            ring,
+            Request::get(&format!("http://127.0.0.1:{port}/echo")).t()?,
+            move |_ctx, _id, result| http_done.set(result.is_ok()),
+        )
+        .t()?;
+    check(
+        drive_until(
+            ring,
+            |ring| {
+                server.drive(ring)?;
+                http1.drive_with(ring, &mut server)?;
+                Ok(http_slot.calls() > 0)
+            },
+            Duration::from_secs(2),
+        )
+        .t()?,
+        "http/1 on the shared port timed out",
+    )
+    .t()?;
+    check(http_slot.take() == Some(true), "http/1 echo").t()?;
+    http1.shutdown_with(ring, &mut server).t()?;
+    drop(http1);
+    let mut http2_config = client_config(4, 5).t()?;
+    http2_config.http2_prior_knowledge = true;
+    http2_config.prefer_http2 = true;
+    let mut http2 = HttpClient::new(ring, http2_config).t()?;
+    let http2_slot = Slot::new();
+    let http2_done = http2_slot.clone();
+    http2
+        .submit(
+            ring,
+            Request::get(&format!("http://127.0.0.1:{port}/echo")).t()?,
+            move |_ctx, _id, result| http2_done.set(result.is_ok()),
+        )
+        .t()?;
+    check(
+        drive_until(
+            ring,
+            |ring| {
+                server.drive(ring)?;
+                http2.drive_with(ring, &mut server)?;
+                Ok(http2_slot.calls() > 0)
+            },
+            Duration::from_secs(2),
+        )
+        .t()?,
+        "http/2 on the shared port timed out",
+    )
+    .t()?;
+    check(http2_slot.take() == Some(true), "http/2 echo").t()?;
+    http2.shutdown_with(ring, &mut server).t()?;
+    drop(http2);
+    let mut websocket = WebSocketClient::new(ring, websocket_config(6, 7).t()?).t()?;
+    let session = websocket
+        .connect(
+            ring,
+            &format!("ws://127.0.0.1:{port}/stream"),
+            Headers::new(),
+            |_ctx, _id, _result| {},
+        )
+        .t()?;
+    let opened = drive_until(
+        ring,
+        |ring| {
+            server.drive(ring)?;
+            websocket.drive_with(ring, &mut server)?;
+            Ok(websocket.is_open(session))
+        },
+        Duration::from_secs(2),
+    )
+    .t()?;
+    check(opened, "websocket on the shared port timed out").t()?;
+    websocket.send_text(ring, session, "subscribe").t()?;
+    let echoed = drive_until(
+        ring,
+        |ring| {
+            server.drive(ring)?;
+            websocket.drive_with(ring, &mut server)?;
+            Ok(texts.borrow().iter().any(|text| text == "subscribe"))
+        },
+        Duration::from_secs(2),
+    )
+    .t()?;
+    check(echoed, "websocket echo on the shared port")
 }

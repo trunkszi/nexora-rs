@@ -501,7 +501,7 @@ fn main() -> nexora::Result<()> {
         .bind(&mut ring, std::net::SocketAddr::from(([127, 0, 0, 1], 8080)))?;
     loop {
         server.drive(&mut ring)?;
-        ring.wait_completions(1, Some(std::time::Duration::ZERO), &mut server)?;
+        ring.tick(&mut server)?;
     }
 }
 ```

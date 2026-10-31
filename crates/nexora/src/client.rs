@@ -260,7 +260,6 @@ impl HttpClient {
         peer: &mut D,
     ) -> Result<usize> {
         self.step(proactor)?;
-        proactor.submit()?;
         let mut dispatch =
             |completion: liburing::Completion,
              submissions: &mut liburing::SubmissionContext<'_>| {
@@ -273,8 +272,9 @@ impl HttpClient {
                     peer.dispatch(completion, submissions)
                 }
             };
-        let count = proactor.wait_completions(1, Some(Duration::ZERO), &mut dispatch)?;
+        let count = proactor.tick(&mut dispatch)?;
         self.step(proactor)?;
+        proactor.submit()?;
         Ok(count)
     }
 

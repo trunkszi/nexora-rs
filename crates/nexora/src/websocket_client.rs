@@ -403,11 +403,8 @@ impl WebSocketClient {
         processed += self.apply_dns(proactor)?;
         self.pump(proactor)?;
         self.dns.flush(proactor)?;
-        proactor.submit()?;
         let mut failure: Option<Error> = None;
-        let harvested = proactor.wait_completions(
-            1,
-            Some(Duration::ZERO),
+        let harvested = proactor.tick(
             &mut |completion: Completion, submissions: &mut SubmissionContext<'_>| {
                 if !crate::dispatch::CompletionRoute::accepts(
                     self,

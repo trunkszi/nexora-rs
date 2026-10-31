@@ -53,7 +53,7 @@ fn body_of(
 }
 
 #[test]
-fn e2e_01_http1_methods_chunked_keepalive_and_https() -> TestResult {
+fn e2e_01_http1_keepalive_https() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let gate = Gate::new(GateMode::Echo);
@@ -189,7 +189,7 @@ fn e2e_01_http1_methods_chunked_keepalive_and_https() -> TestResult {
 }
 
 #[test]
-fn e2e_02_h2c_and_tls_multiplex_at_least_32_streams() -> TestResult {
+fn e2e_02_http2_tls_multiplex() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let config = server_config(3).t()?;
@@ -281,7 +281,7 @@ fn e2e_02_h2c_and_tls_multiplex_at_least_32_streams() -> TestResult {
 }
 
 #[test]
-fn e2e_03_callback_submits_the_next_step_and_a_timer() -> TestResult {
+fn e2e_03_reentrant_callback_chain() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let mut server = HttpServer::bind(
@@ -360,7 +360,7 @@ fn e2e_03_callback_submits_the_next_step_and_a_timer() -> TestResult {
 }
 
 #[test]
-fn e2e_04_deferred_responder_waits_for_upstream() -> TestResult {
+fn e2e_04_deferred_upstream_response() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let inbound_gate = Gate::new(GateMode::Echo);
@@ -453,7 +453,7 @@ fn e2e_04_deferred_responder_waits_for_upstream() -> TestResult {
 }
 
 #[test]
-fn e2e_05_websocket_text_binary_and_proactive_send() -> TestResult {
+fn e2e_05_websocket_echo_push() -> TestResult {
     let _exclusive = support::exclusive();
     let mut ring = proactor().t()?;
     let echo = WebSocketEcho::new();
@@ -567,8 +567,22 @@ fn e2e_05_websocket_text_binary_and_proactive_send() -> TestResult {
     let secure = drive_until(
         &mut ring,
         |ring| {
+            server.drive(ring)?;
             tls_server.drive(ring)?;
-            wss.drive_with(ring, &mut tls_server)?;
+            client.drive_with(
+                ring,
+                &mut nexora::CompletionRoutes::new(
+                    &mut server,
+                    &mut nexora::CompletionRoutes::new(&mut tls_server, &mut wss),
+                ),
+            )?;
+            wss.drive_with(
+                ring,
+                &mut nexora::CompletionRoutes::new(
+                    &mut tls_server,
+                    &mut nexora::CompletionRoutes::new(&mut server, &mut client),
+                ),
+            )?;
             Ok(wss.is_open(wss_session))
         },
         Duration::from_secs(3),
@@ -578,7 +592,7 @@ fn e2e_05_websocket_text_binary_and_proactive_send() -> TestResult {
 }
 
 #[test]
-fn e2e_06_custom_ca_and_mock_dns() -> TestResult {
+fn e2e_06_tls_mock_dns() -> TestResult {
     let _exclusive = support::exclusive();
     let dns = MockDns::spawn(DnsPlan::answer(vec![Ipv4Addr::LOCALHOST]))
         .map_err(show)
@@ -662,123 +676,28 @@ fn e2e_06_custom_ca_and_mock_dns() -> TestResult {
 }
 
 #[test]
-fn e2e_07_one_port_serves_http1_http2_and_websocket() -> TestResult {
+fn e2e_07_shared_port_protocols() -> TestResult {
     let _exclusive = support::exclusive();
-    let threads = support::thread_count().map_err(show).t()?;
+    let threads = support::thread_count().t()?;
     let mut ring = proactor().t()?;
-    let echo = WebSocketEcho::new();
-    let texts = echo.texts();
-    let config = server_config(3).t()?;
-    let mut server = HttpServer::bind(
-        &mut ring,
-        support::ephemeral(),
-        config,
-        Gate::new(GateMode::Echo),
-    )
-    .t()?
-    .with_websocket_handler("/stream", echo);
-    let port = server.local_addr().port();
-    let mut http1 = HttpClient::new(&mut ring, client_config(1, 2).t()?).t()?;
-    let http_slot = Slot::new();
-    let http_done = http_slot.clone();
-    http1
-        .submit(
-            &mut ring,
-            Request::get(&format!("http://127.0.0.1:{port}/echo"))
-                .map_err(show)
-                .t()?,
-            move |_ctx, _id, result| http_done.set(result.is_ok()),
-        )
-        .map_err(show)
-        .t()?;
+    support::shared_port_exchange(&mut ring)?;
     check(
-        drive_until(
-            &mut ring,
-            |ring| {
-                server.drive(ring)?;
-                http1.drive_with(ring, &mut server)?;
-                Ok(http_slot.calls() > 0)
-            },
-            Duration::from_secs(2),
-        )
-        .t()?,
-        "http/1 on the shared port timed out",
-    )
-    .t()?;
-    check(http_slot.take() == Some(true), "http/1 echo").t()?;
-    http1.shutdown_with(&mut ring, &mut server).t()?;
-    drop(http1);
-    let mut http2_config = client_config(4, 5).t()?;
-    http2_config.http2_prior_knowledge = true;
-    http2_config.prefer_http2 = true;
-    let mut http2 = HttpClient::new(&mut ring, http2_config).t()?;
-    let http2_slot = Slot::new();
-    let http2_done = http2_slot.clone();
-    http2
-        .submit(
-            &mut ring,
-            Request::get(&format!("http://127.0.0.1:{port}/echo"))
-                .map_err(show)
-                .t()?,
-            move |_ctx, _id, result| http2_done.set(result.is_ok()),
-        )
-        .map_err(show)
-        .t()?;
-    check(
-        drive_until(
-            &mut ring,
-            |ring| {
-                server.drive(ring)?;
-                http2.drive_with(ring, &mut server)?;
-                Ok(http2_slot.calls() > 0)
-            },
-            Duration::from_secs(2),
-        )
-        .t()?,
-        "http/2 on the shared port timed out",
-    )
-    .t()?;
-    check(http2_slot.take() == Some(true), "http/2 echo").t()?;
-    http2.shutdown_with(&mut ring, &mut server).t()?;
-    drop(http2);
-    let mut websocket = WebSocketClient::new(&mut ring, websocket_config(6, 7).t()?).t()?;
-    let session = websocket
-        .connect(
-            &mut ring,
-            &format!("ws://127.0.0.1:{port}/stream"),
-            Headers::new(),
-            |_ctx, _id, _result| {},
-        )
-        .map_err(show)
-        .t()?;
-    let opened = drive_until(
-        &mut ring,
-        |ring| {
-            server.drive(ring)?;
-            websocket.drive_with(ring, &mut server)?;
-            Ok(websocket.is_open(session))
-        },
-        Duration::from_secs(2),
-    )
-    .t()?;
-    check(opened, "websocket on the shared port timed out").t()?;
-    websocket
-        .send_text(&mut ring, session, "subscribe")
-        .map_err(show)
-        .t()?;
-    let echoed = drive_until(
-        &mut ring,
-        |ring| {
-            server.drive(ring)?;
-            websocket.drive_with(ring, &mut server)?;
-            Ok(texts.borrow().iter().any(|text| text == "subscribe"))
-        },
-        Duration::from_secs(2),
-    )
-    .t()?;
-    check(echoed, "websocket echo on the shared port").t()?;
-    check(
-        support::thread_count().map_err(show).t()? == threads,
+        support::thread_count().t()? == threads,
         "thread count stayed at the baseline",
     )
+}
+
+#[test]
+fn e2e_sqpoll_shared_port() -> TestResult {
+    let _exclusive = support::exclusive();
+    let threads = support::thread_count().t()?;
+    let Some(mut ring) = support::sqpoll_proactor().t()? else {
+        return Ok(());
+    };
+    support::shared_port_exchange(&mut ring)?;
+    check(
+        support::thread_count().t()? == threads,
+        "user thread count grew",
+    )?;
+    ring.shutdown().t()
 }
