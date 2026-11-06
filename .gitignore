@@ -1,0 +1,11 @@
+/target
+/.scratch
+**/*.rs.bk
+*.orig
+.DS_Store
+.agents/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md
+.scratch/

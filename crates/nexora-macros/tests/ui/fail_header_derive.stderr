@@ -1,0 +1,5 @@
+error: invalid HTTP header name
+ --> tests/ui/fail_header_derive.rs:4:21
+  |
+4 |     #[header(name = "bad:name")]
+  |                     ^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: path parameter field has no matching placeholder
+ --> tests/ui/fail_rest_unused_param.rs:6:5
+  |
+6 |     id: String,
+  |     ^^
