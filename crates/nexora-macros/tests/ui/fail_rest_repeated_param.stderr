@@ -1,0 +1,5 @@
+error: path parameters must appear exactly once
+ --> tests/ui/fail_rest_repeated_param.rs:3:31
+  |
+3 | #[rest(method = "GET", path = "/items/{id}/{id}")]
+  |                               ^^^^^^^^^^^^^^^^^^

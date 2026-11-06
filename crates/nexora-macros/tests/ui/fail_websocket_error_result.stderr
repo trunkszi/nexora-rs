@@ -1,0 +1,5 @@
+error: on_error must return ()
+ --> tests/ui/fail_websocket_error_result.rs:7:71
+  |
+7 |     fn on_error(&mut self, _: &mut WebSocketServerSession, _: &Error) -> Result<()> {
+  |                                                                       ^^^^^^^^^^^^^

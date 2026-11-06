@@ -1,0 +1,5 @@
+error: expected context, request, and optional responder arguments
+ --> tests/ui/fail_route_signature.rs:6:5
+  |
+6 |     fn items(&mut self) {}
+  |     ^^^^^^^^^^^^^^^^^^^

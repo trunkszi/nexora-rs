@@ -1,0 +1,5 @@
+error: path placeholders must occupy a complete path segment
+ --> tests/ui/fail_route_placeholder.rs:7:36
+  |
+7 |     #[route(method = "GET", path = "/items/prefix-{id}")]
+  |                                    ^^^^^^^^^^^^^^^^^^^^

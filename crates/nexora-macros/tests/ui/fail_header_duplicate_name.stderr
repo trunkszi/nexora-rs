@@ -1,0 +1,5 @@
+error: multiple fields map to the same header name
+ --> tests/ui/fail_header_duplicate_name.rs:7:21
+  |
+7 |     #[header(name = "x-token")]
+  |                     ^^^^^^^^^
